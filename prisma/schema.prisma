@@ -1,0 +1,86 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id               String    @id @default(uuid())
+  email            String    @unique
+  username         String    @unique
+  password         String
+  stylePreferences Json?
+  createdAt        DateTime  @default(now())
+  
+  outfits          Outfit[]
+  likes            Like[]
+  dailyQuotas      DailyQuota[]
+}
+
+model Outfit {
+  id           String       @id @default(uuid())
+  userId       String
+  imageUrl     String
+  products     Json[]
+  style        String?
+  status       OutfitStatus @default(active)
+  reportCount  Int          @default(0)
+  reportReason String?
+  createdAt    DateTime     @default(now())
+  
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  likes        Like[]
+  productLinks ProductLink[]
+}
+
+model Like {
+  id       String @id @default(uuid())
+  userId   String
+  outfitId String
+  
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  outfit   Outfit @relation(fields: [outfitId], references: [id], onDelete: Cascade)
+  
+  @@unique([userId, outfitId])
+}
+
+model DailyQuota {
+  id     String   @id @default(uuid())
+  userId String
+  date   DateTime @db.Date
+  count  Int      @default(0)
+  
+  user   User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@unique([userId, date])
+}
+
+model ProductLink {
+  id       String           @id @default(uuid())
+  outfitId String
+  url      String
+  domain   String?
+  isValid  Boolean          @default(true)
+  status   ProductLinkStatus @default(pending)
+  metadata Json?
+  
+  outfit   Outfit           @relation(fields: [outfitId], references: [id], onDelete: Cascade)
+  
+  @@index([status])
+}
+
+enum ProductLinkStatus {
+  pending
+  valid
+  invalid
+}
+
+enum OutfitStatus {
+  active
+  reported
+  banned
+  ai_generated
+}

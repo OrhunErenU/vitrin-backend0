@@ -35,11 +35,11 @@ services:
           name: vitrin-redis
           property: connectionString
 
+  - type: redis
+    name: vitrin-redis
+    ipAllowList: []
+
 databases:
   - name: vitrin-db
     databaseName: vitrin
     user: vitrin
-
-redis:
-  - name: vitrin-redis
-    maxmemoryPolicy: noeviction

@@ -1,102 +1,135 @@
+const { Worker } = require('bullmq');
+const Redis = require('ioredis');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { PrismaClient } = require('@prisma/client');
-const { validationQueue, connection } = require('./queue');
-const blacklist = require('../config/blacklist');
 
 const prisma = new PrismaClient();
 
-const validateLink = async (job) => {
-    const { linkId, url } = job.data;
-    console.log(`Validating: ${url}`);
+// Redis bağlantısı (Render Redis URL)
+const connection = new Redis(process.env.REDIS_URL, {
+  maxRetriesPerRequest: null,
+  enableReadyCheck: false
+});
 
-    try {
-        // Extract domain
-        const domain = new URL(url).hostname;
+// Blacklist (geçici hardcoded, ileride config'den çekilebilir)
+const BLACKLIST = ['scam.com', 'fake.net', 'phishing.org'];
 
-        // Check blacklist
-        if (blacklist.some(bad => domain.includes(bad))) {
-            await prisma.productLink.update({
-                where: { id: linkId },
-                data: { status: 'invalid', isValid: false, metadata: { error: 'Domain blacklisted' } }
-            });
-            return { valid: false, reason: 'blacklisted' };
+// Link doğrulama fonksiyonu
+async function validateLinkProcessor(job) {
+  const { linkId, url } = job.data;
+  
+  console.log(`Validating: ${url}`);
+  
+  try {
+    // URL parse et
+    const urlObj = new URL(url);
+    const domain = urlObj.hostname.replace('www.', '');
+    
+    // Blacklist kontrolü
+    if (BLACKLIST.some(bad => domain.includes(bad))) {
+      await prisma.productLink.update({
+        where: { id: linkId },
+        data: { 
+          status: 'invalid',
+          metadata: { error: 'Domain blacklisted' }
         }
-
-        // HEAD request with timeout and redirects
-        const response = await axios.head(url, {
-            timeout: 10000,
-            maxRedirects: 5,
-            validateStatus: () => true
-        });
-
-        if (response.status !== 200) {
-            await prisma.productLink.update({
-                where: { id: linkId },
-                data: { status: 'invalid', isValid: false, metadata: { error: `HTTP ${response.status}` } }
-            });
-            return { valid: false, reason: 'non_200' };
-        }
-
-        // Check content type
-        const contentType = response.headers['content-type'] || '';
-        if (!contentType.includes('text/html')) {
-            await prisma.productLink.update({
-                where: { id: linkId },
-                data: { status: 'invalid', isValid: false, metadata: { error: 'Not HTML' } }
-            });
-            return { valid: false, reason: 'not_html' };
-        }
-
-        // Fetch full page for parsing
-        const html = await axios.get(url, { timeout: 10000 });
-        const $ = cheerio.load(html.data);
-
-        // Extract metadata
-        const title = $('meta[property="og:title"]').attr('content') || $('title').text() || null;
-        const image = $('meta[property="og:image"]').attr('content') || null;
-
-        // Price extraction (meta or regex)
-        let price = $('meta[property="product:price"]').attr('content') || null;
-        if (!price) {
-            const priceMatch = html.data.match(/["\'](?:[$€£₺]?\s?\d+[.,]\d{2})["\']/);
-            price = priceMatch ? priceMatch[0].replace(/["\']/g, '') : null;
-        }
-
-        await prisma.productLink.update({
-            where: { id: linkId },
-            data: {
-                status: 'valid',
-                isValid: true,
-                domain,
-                metadata: {
-                    title,
-                    image,
-                    price,
-                    validatedAt: new Date().toISOString()
-                }
-            }
-        });
-
-        return { valid: true, title, image, price };
-    } catch (error) {
-        await prisma.productLink.update({
-            where: { id: linkId },
-            data: { status: 'invalid', isValid: false, metadata: { error: error.message } }
-        });
-        return { valid: false, reason: error.message };
+      });
+      return { status: 'invalid', reason: 'blacklist' };
     }
-};
+    
+    // HTTP isteği (HEAD yerine GET, çünkü bazı siteler HEAD'e izin vermiyor)
+    const response = await axios.get(url, {
+      timeout: 10000,
+      maxRedirects: 5,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    });
+    
+    if (response.status !== 200) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    
+    // HTML parse
+    const $ = cheerio.load(response.data);
+    const title = $('meta[property="og:title"]').attr('content') || 
+                  $('meta[name="title"]').attr('content') || 
+                  $('title').text() || 
+                  'Unknown Product';
+                  
+    const image = $('meta[property="og:image"]').attr('content') || 
+                  $('meta[name="twitter:image"]').attr('content') || 
+                  '';
+                  
+    const price = $('meta[property="product:price:amount"]').attr('content') || 
+                  $('meta[property="og:price:amount"]').attr('content') || 
+                  $('.price, .product-price, [class*="price"]').first().text().trim() || 
+                  '';
+    
+    // Veritabanını güncelle
+    await prisma.productLink.update({
+      where: { id: linkId },
+      data: {
+        status: 'valid',
+        isValid: true,
+        domain: domain,
+        metadata: {
+          title: title.substring(0, 200),
+          image: image.substring(0, 500),
+          price: price.substring(0, 50),
+          validatedAt: new Date().toISOString()
+        }
+      }
+    });
+    
+    console.log(`✓ Valid: ${domain} - ${title}`);
+    return { status: 'valid', domain, title };
+    
+  } catch (error) {
+    console.error(`✗ Invalid: ${url} - ${error.message}`);
+    
+    await prisma.productLink.update({
+      where: { id: linkId },
+      data: {
+        status: 'invalid',
+        isValid: false,
+        metadata: { 
+          error: error.message,
+          validatedAt: new Date().toISOString()
+        }
+      }
+    });
+    
+    return { status: 'invalid', error: error.message };
+  }
+}
 
-// Start worker
-const worker = new Worker('link-validation', validateLink, { connection, concurrency: 5 });
+// Worker oluştur (BullMQ Worker class'ı import edildi!)
+const worker = new Worker('link-validation', validateLinkProcessor, {
+  connection,
+  concurrency: 3,
+  limiter: {
+    max: 10,
+    duration: 1000
+  }
+});
 
-worker.on('completed', job => {
-    console.log(`Job ${job.id} completed`);
+// Event listeners
+worker.on('completed', (job) => {
+  console.log(`Job ${job.id} completed`);
 });
 
 worker.on('failed', (job, err) => {
-    console.error(`Job ${job.id} failed:`, err.message);
+  console.error(`Job ${job.id} failed:`, err.message);
 });
 
-module.exports = { validateLink, worker };
+console.log('🚀 Link Validator Worker started...');
+console.log('📡 Connected to Redis:', process.env.REDIS_URL ? 'YES' : 'NO');
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  await worker.close();
+  await prisma.$disconnect();
+  process.exit(0);
+});

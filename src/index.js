@@ -1,3 +1,11 @@
+const cors = require('cors');
+// ... diğer importlar
+
+app.use(cors({
+  origin: '*', // Güvenlik için sonra değiştirilir, şimdi test için *
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
